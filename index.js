@@ -2,201 +2,275 @@ import express from 'express';
 import fs from 'fs';
 import ws from 'ws';
 import expressWs from 'express-ws';
-import {job} from './keep_alive.js';
-import {OpenAIOperations} from './openai_operations.js';
-import {TwitchBot} from './twitch_bot.js';
+import { OpenAIOperations } from './openai_operations.js';
+import { TwitchBot } from './twitch_bot.js';
 
-// Start keep alive cron job
-job.start();
-console.log(process.env);
+const requiredEnvironmentVariables = [
+    'OPENAI_API_KEY',
+    'TWITCH_USER',
+    'TWITCH_AUTH',
+    'CHANNELS',
+];
 
-// Setup express app
-const app = express();
-const expressWsInstance = expressWs(app);
+const missingEnvironmentVariables = requiredEnvironmentVariables.filter(
+    key => !process.env[key]?.trim()
+);
 
-// Set the view engine to ejs
-app.set('view engine', 'ejs');
+if (missingEnvironmentVariables.length > 0) {
+    console.error(
+        `STARTUP_FAILED: Missing required environment variables: ${missingEnvironmentVariables.join(', ')}`
+    );
+    process.exit(1);
+}
 
-// Load environment variables
-const GPT_MODE = process.env.GPT_MODE || 'CHAT';
-const HISTORY_LENGTH = process.env.HISTORY_LENGTH || 5;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const MODEL_NAME = process.env.MODEL_NAME || 'gpt-3.5-turbo';
-const TWITCH_USER = process.env.TWITCH_USER || 'oSetinhasBot';
-const TWITCH_AUTH = process.env.TWITCH_AUTH || 'oauth:vgvx55j6qzz1lkt3cwggxki1lv53c2';
-const COMMAND_NAME = process.env.COMMAND_NAME || '!gpt';
-const CHANNELS = process.env.CHANNELS || 'oSetinhas,jones88';
+const GPT_MODE = (process.env.GPT_MODE || 'CHAT').toUpperCase();
+const HISTORY_LENGTH = Number.parseInt(process.env.HISTORY_LENGTH || '5', 10);
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY.trim();
+const MODEL_NAME = process.env.MODEL_NAME || 'gpt-4.1-mini';
+const TWITCH_USER = process.env.TWITCH_USER.trim();
+const TWITCH_AUTH = process.env.TWITCH_AUTH.trim().startsWith('oauth:')
+    ? process.env.TWITCH_AUTH.trim()
+    : `oauth:${process.env.TWITCH_AUTH.trim()}`;
+const COMMAND_NAME = process.env.COMMAND_NAME || 'steel,!steel';
+const CHANNELS = process.env.CHANNELS;
 const SEND_USERNAME = process.env.SEND_USERNAME || 'true';
 const ENABLE_TTS = process.env.ENABLE_TTS || 'false';
 const ENABLE_CHANNEL_POINTS = process.env.ENABLE_CHANNEL_POINTS || 'false';
-const COOLDOWN_DURATION = parseInt(process.env.COOLDOWN_DURATION, 10) || 10; // Cooldown duration in seconds
+const COOLDOWN_DURATION = Number.parseInt(process.env.COOLDOWN_DURATION || '10', 10);
+const PORT = Number.parseInt(process.env.PORT || '10000', 10);
+const HOST = '0.0.0.0';
 
-if (!OPENAI_API_KEY) {
-    console.error('No OPENAI_API_KEY found. Please set it as an environment variable.');
+const commandNames = COMMAND_NAME
+    .split(',')
+    .map(command => command.trim().toLowerCase())
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+
+const channels = CHANNELS
+    .split(',')
+    .map(channel => channel.trim().replace(/^#/, ''))
+    .filter(Boolean);
+
+if (channels.length === 0) {
+    console.error('STARTUP_FAILED: CHANNELS must contain at least one Twitch channel.');
+    process.exit(1);
 }
 
-const commandNames = COMMAND_NAME.split(',').map(cmd => cmd.trim().toLowerCase());
-const channels = CHANNELS.split(',').map(channel => channel.trim());
 const maxLength = 399;
-let fileContext = 'You are a helpful Twitch Chatbot.';
-let lastUserMessage = '';
-let lastResponseTime = 0; // Track the last response time
+let lastResponseTime = 0;
+let twitchConnected = false;
 
-// Setup Twitch bot
-console.log('Channels: ', channels);
-const bot = new TwitchBot(TWITCH_USER, TWITCH_AUTH, channels, OPENAI_API_KEY, ENABLE_TTS);
-
-// Setup OpenAI operations
-fileContext = fs.readFileSync('./file_context.txt', 'utf8');
-const openaiOps = new OpenAIOperations(fileContext, OPENAI_API_KEY, MODEL_NAME, HISTORY_LENGTH);
-
-// Setup Twitch bot callbacks
-bot.onConnected((addr, port) => {
-    console.log(`* Connected to ${addr}:${port}`);
-    channels.forEach(channel => {
-        console.log(`* Joining ${channel}`);
-        console.log(`* Saying hello in ${channel}`);
-    });
-});
-
-bot.onDisconnected(reason => {
-    console.log(`Disconnected: ${reason}`);
-});
-
-// Connect bot
-bot.connect(
-    () => {
-        console.log('Bot connected!');
-    },
-    error => {
-        console.error('Bot couldn\'t connect!', error);
-    }
+const fileContext = fs.readFileSync('./file_context.txt', 'utf8');
+const openaiOps = new OpenAIOperations(
+    fileContext,
+    OPENAI_API_KEY,
+    MODEL_NAME,
+    HISTORY_LENGTH
+);
+const bot = new TwitchBot(
+    TWITCH_USER,
+    TWITCH_AUTH,
+    channels,
+    OPENAI_API_KEY,
+    ENABLE_TTS
 );
 
-bot.onMessage(async (channel, user, message, self) => {
-    if (self) return;
+const app = express();
+const expressWsInstance = expressWs(app);
 
-    const currentTime = Date.now();
-    const elapsedTime = (currentTime - lastResponseTime) / 1000; // Time in seconds
+app.set('view engine', 'ejs');
+app.use(express.json({ extended: true, limit: '1mb' }));
+app.use('/public', express.static('public'));
 
-    if (ENABLE_CHANNEL_POINTS === 'true' && user['msg-id'] === 'highlighted-message') {
-        console.log(`Highlighted message: ${message}`);
-        if (elapsedTime < COOLDOWN_DURATION) {
-            bot.say(channel, `Cooldown active. Please wait ${COOLDOWN_DURATION - elapsedTime.toFixed(1)} seconds before sending another message.`);
-            return;
-        }
-        lastResponseTime = currentTime; // Update the last response time
-
-        const response = await openaiOps.make_openai_call(message);
-        bot.say(channel, response);
-    }
-
-    const command = commandNames.find(cmd => message.toLowerCase().startsWith(cmd));
-    if (command) {
-        if (elapsedTime < COOLDOWN_DURATION) {
-            bot.say(channel, `Cooldown active. Please wait ${COOLDOWN_DURATION - elapsedTime.toFixed(1)} seconds before sending another message.`);
-            return;
-        }
-        lastResponseTime = currentTime; // Update the last response time
-
-        let text = message.slice(command.length).trim();
-        if (SEND_USERNAME === 'true') {
-            text = `Message from user ${user.username}: ${text}`;
-        }
-
-        const response = await openaiOps.make_openai_call(text);
-        if (response.length > maxLength) {
-            const messages = response.match(new RegExp(`.{1,${maxLength}}`, 'g'));
-            messages.forEach((msg, index) => {
-                setTimeout(() => {
-                    bot.say(channel, msg);
-                }, 1000 * index);
-            });
-        } else {
-            bot.say(channel, response);
-        }
-
-        if (ENABLE_TTS === 'true') {
-            try {
-                const ttsAudioUrl = await bot.sayTTS(channel, response, user['userstate']);
-                notifyFileChange(ttsAudioUrl);
-            } catch (error) {
-                console.error('TTS Error:', error);
-            }
-        }
-    }
-});
-
-app.ws('/check-for-updates', (ws, req) => {
-    ws.on('message', message => {
-        // Handle WebSocket messages (if needed)
+app.get('/health', (req, res) => {
+    const status = twitchConnected ? 200 : 503;
+    res.status(status).json({
+        status: twitchConnected ? 'ok' : 'degraded',
+        twitchConnected,
+        twitchUser: TWITCH_USER,
+        channels,
+        model: MODEL_NAME,
+        triggers: commandNames,
     });
 });
 
-const messages = [{role: 'system', content: 'You are a helpful Twitch Chatbot.'}];
-console.log('GPT_MODE:', GPT_MODE);
-console.log('History length:', HISTORY_LENGTH);
-console.log('OpenAI API Key:', OPENAI_API_KEY);
-console.log('Model Name:', MODEL_NAME);
-
-app.use(express.json({extended: true, limit: '1mb'}));
-app.use('/public', express.static('public'));
-
 app.all('/', (req, res) => {
-    console.log('Received a request!');
     res.render('pages/index');
 });
 
-if (GPT_MODE === 'CHAT') {
-    fs.readFile('./file_context.txt', 'utf8', (err, data) => {
-        if (err) throw err;
-        console.log('Reading context file and adding it as system-level message for the agent.');
-        messages[0].content = data;
-    });
-} else {
-    fs.readFile('./file_context.txt', 'utf8', (err, data) => {
-        if (err) throw err;
-        console.log('Reading context file and adding it in front of user prompts:');
-        fileContext = data;
-    });
-}
-
 app.get('/gpt/:text', async (req, res) => {
-    const text = req.params.text;
-
-    let answer = '';
     try {
-        if (GPT_MODE === 'CHAT') {
-            answer = await openaiOps.make_openai_call(text);
-        } else if (GPT_MODE === 'PROMPT') {
-            const prompt = `${fileContext}\n\nUser: ${text}\nAgent:`;
-            answer = await openaiOps.make_openai_call_completion(prompt);
-        } else {
-            throw new Error('GPT_MODE is not set to CHAT or PROMPT. Please set it as an environment variable.');
-        }
+        const text = req.params.text;
+        const answer = GPT_MODE === 'PROMPT'
+            ? await openaiOps.make_openai_call_completion(`${fileContext}\n\nUser: ${text}\nAgent:`)
+            : await openaiOps.make_openai_call(text);
 
         res.send(answer);
     } catch (error) {
-        console.error('Error generating response:', error);
+        console.error('OPENAI_ROUTE_FAILED:', error);
         res.status(500).send('An error occurred while generating the response.');
     }
 });
 
-const server = app.listen(3000, () => {
-    console.log('Server running on port 3000');
+app.ws('/check-for-updates', socket => {
+    socket.on('message', () => {
+        // Reserved for the optional TTS browser source.
+    });
 });
 
 const wss = expressWsInstance.getWss();
-wss.on('connection', ws => {
-    ws.on('message', message => {
-        // Handle client messages (if needed)
-    });
-});
 
 function notifyFileChange() {
     wss.clients.forEach(client => {
         if (client.readyState === ws.OPEN) {
-            client.send(JSON.stringify({updated: true}));
+            client.send(JSON.stringify({ updated: true }));
         }
     });
 }
+
+function extractTrigger(message) {
+    const trimmedMessage = message.trim();
+    const lowerMessage = trimmedMessage.toLowerCase();
+
+    for (const command of commandNames) {
+        if (lowerMessage === command) {
+            return { command, text: '' };
+        }
+
+        if (lowerMessage.startsWith(`${command} `)) {
+            return {
+                command,
+                text: trimmedMessage.slice(command.length).trim(),
+            };
+        }
+    }
+
+    return null;
+}
+
+async function sendResponseInChunks(channel, response) {
+    if (response.length <= maxLength) {
+        await bot.say(channel, response);
+        return;
+    }
+
+    const chunks = response.match(new RegExp(`.{1,${maxLength}}`, 'g')) || [];
+    for (const chunk of chunks) {
+        await bot.say(channel, chunk);
+    }
+}
+
+bot.onConnected((address, port) => {
+    twitchConnected = true;
+    console.log(`TWITCH_CONNECTED: ${address}:${port}`);
+    console.log(`TWITCH_CHANNELS: ${channels.join(', ')}`);
+});
+
+bot.onDisconnected(reason => {
+    twitchConnected = false;
+    console.error(`TWITCH_DISCONNECTED: ${reason}`);
+});
+
+bot.onMessage(async (channel, userstate, message, self) => {
+    if (self) return;
+
+    try {
+        const currentTime = Date.now();
+        const elapsedTime = (currentTime - lastResponseTime) / 1000;
+
+        if (
+            ENABLE_CHANNEL_POINTS === 'true' &&
+            userstate['msg-id'] === 'highlighted-message'
+        ) {
+            if (elapsedTime < COOLDOWN_DURATION) {
+                await bot.say(
+                    channel,
+                    `Cooldown active. Please wait ${(COOLDOWN_DURATION - elapsedTime).toFixed(1)} seconds.`
+                );
+                return;
+            }
+
+            lastResponseTime = currentTime;
+            const highlightedResponse = await openaiOps.make_openai_call(message);
+            await sendResponseInChunks(channel, highlightedResponse);
+            return;
+        }
+
+        const trigger = extractTrigger(message);
+        if (!trigger) return;
+
+        const normalizedText = trigger.text.toLowerCase();
+        if (normalizedText === 'ping' || normalizedText === 'status') {
+            await bot.say(channel, 'S.T.E.E.L. online.');
+            return;
+        }
+
+        if (!trigger.text) {
+            await bot.say(channel, 'Try: !steel ping or Steel who counters Hulk?');
+            return;
+        }
+
+        if (elapsedTime < COOLDOWN_DURATION) {
+            await bot.say(
+                channel,
+                `Cooldown active. Please wait ${(COOLDOWN_DURATION - elapsedTime).toFixed(1)} seconds.`
+            );
+            return;
+        }
+
+        lastResponseTime = currentTime;
+        const username = userstate.username || userstate['display-name'] || 'viewer';
+        const prompt = SEND_USERNAME === 'true'
+            ? `Message from user ${username}: ${trigger.text}`
+            : trigger.text;
+
+        const response = await openaiOps.make_openai_call(prompt);
+        await sendResponseInChunks(channel, response);
+
+        if (ENABLE_TTS === 'true') {
+            const ttsAudioUrl = await bot.sayTTS(channel, response, userstate);
+            if (ttsAudioUrl) notifyFileChange();
+        }
+    } catch (error) {
+        console.error('MESSAGE_HANDLER_FAILED:', error);
+        try {
+            await bot.say(channel, 'S.T.E.E.L. encountered an error. Check the service logs.');
+        } catch (sendError) {
+            console.error('ERROR_MESSAGE_FAILED:', sendError);
+        }
+    }
+});
+
+const server = app.listen(PORT, HOST, () => {
+    console.log(`HTTP_READY: http://${HOST}:${PORT}`);
+    console.log(`OPENAI_MODEL: ${MODEL_NAME}`);
+    console.log(`COMMAND_TRIGGERS: ${commandNames.join(', ')}`);
+});
+
+bot.connect()
+    .then(() => {
+        twitchConnected = true;
+        console.log('BOT_READY: Twitch connection established.');
+    })
+    .catch(error => {
+        twitchConnected = false;
+        console.error('STARTUP_FAILED: Twitch connection could not be established.');
+        console.error(error);
+        server.close(() => process.exit(1));
+    });
+
+async function shutdown(signal) {
+    console.log(`SHUTDOWN_REQUESTED: ${signal}`);
+
+    try {
+        await bot.disconnect();
+    } catch (error) {
+        console.error('TWITCH_DISCONNECT_FAILED:', error);
+    }
+
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 10000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
